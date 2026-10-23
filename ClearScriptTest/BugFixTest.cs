@@ -2067,11 +2067,62 @@ namespace Microsoft.ClearScript.Test
             engine.CollectGarbage(true);
         }
 
+        [TestMethod, TestCategory("BugFix")]
+        public void BugFix_V8_WasmCodeGCDuringConcurrentDisposal()
+        {
+            const int rounds = 50;
+            const int enginesPerRound = 16;
+            const int importCount = 1000;
+
+            for (var round = 0; round < rounds; round++)
+            {
+                var tasks = Enumerable.Range(0, enginesPerRound).Select(_ => Task.Run(() =>
+                {
+                    using (var wasmEngine = new V8ScriptEngine())
+                    {
+                        wasmEngine.Execute(wasmImportWrapperScript);
+                        wasmEngine.Script.run(importCount);
+                    }
+                })).ToArray();
+
+                Assert.IsTrue(Task.WaitAll(tasks, TimeSpan.FromSeconds(60)), "V8 isolate disposal deadlocked in round {0}", round);
+            }
+        }
+
         // ReSharper restore InconsistentNaming
 
         #endregion
 
         #region miscellaneous
+
+        private const string wasmImportWrapperScript = @"
+            function leb(n) { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; }
+            function section(id, bytes) { return [id, ...leb(bytes.length), ...bytes]; }
+            function str(s) { return [...leb(s.length), ...Array.from(s, c => c.charCodeAt(0))]; }
+            const valTypes = [0x7f, 0x7e, 0x7d, 0x7c];
+            function signature(n) { const params = []; let x = n; do { params.push(valTypes[x % 4]); x = Math.floor(x / 4); } while (x > 0); return params; }
+            function defaultValue(t) { return t === 0x7f ? [0x41, 0] : t === 0x7e ? [0x42, 0] : t === 0x7d ? [0x43, 0, 0, 0, 0] : [0x44, 0, 0, 0, 0, 0, 0, 0, 0]; }
+            function buildModule(importCount) {
+                const types = [...leb(importCount + 1)];
+                for (let i = 0; i < importCount; i++) { const p = signature(i); types.push(0x60, ...leb(p.length), ...p, 0); }
+                types.push(0x60, 0, 0);
+                const imports = [...leb(importCount)];
+                for (let i = 0; i < importCount; i++) imports.push(...str('env'), ...str('f' + i), 0, ...leb(i));
+                const funcs = [1, ...leb(importCount)];
+                const exps = [1, ...str('callAll'), 0, ...leb(importCount)];
+                const body = [0];
+                for (let i = 0; i < importCount; i++) { for (const t of signature(i)) body.push(...defaultValue(t)); body.push(0x10, ...leb(i)); }
+                body.push(0x0b);
+                const code = [1, ...leb(body.length), ...body];
+                return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...section(1, types), ...section(2, imports), ...section(3, funcs), ...section(7, exps), ...section(10, code)]);
+            }
+            function run(importCount) {
+                const env = {};
+                for (let i = 0; i < importCount; i++) env['f' + i] = function () {};
+                const instance = new WebAssembly.Instance(new WebAssembly.Module(buildModule(importCount)), { env });
+                instance.exports.callAll();
+                instance.exports.callAll();
+            }";
 
         public class NullableTest
         {

@@ -262,12 +262,10 @@ bool V8ForegroundTaskRunner::NonNestableDelayedTasksEnabled() const
 
 void V8ForegroundTaskRunner::PostTaskImpl(std::unique_ptr<v8::Task> upTask, const v8::SourceLocation& /*location*/)
 {
+    // Tasks posted to a released isolate are dropped, not run inline: V8 may post them while
+    // holding internal locks (e.g. the wasm code GC), so running them here can self-deadlock.
     auto spIsolate = m_wrIsolate.GetTarget();
-    if (spIsolate.IsEmpty())
-    {
-        upTask->Run();
-    }
-    else
+    if (!spIsolate.IsEmpty())
     {
         m_IsolateImpl.RunTaskWithLockAsync(true, std::move(upTask));
     }
@@ -1214,31 +1212,21 @@ void V8IsolateImpl::RunTaskDelayed(std::unique_ptr<v8::Task> upTask, double dela
 
 void V8IsolateImpl::RunTaskWithLockAsync(bool allowNesting, std::unique_ptr<v8::Task> upTask)
 {
-    if (upTask)
+    if (upTask && !m_Released)
     {
-        if (m_Released)
+        std::shared_ptr<v8::Task> spTask(std::move(upTask));
+        CallWithLockAsync(allowNesting, [allowNesting, spTask] (V8IsolateImpl* pIsolateImpl)
         {
-            if (allowNesting)
-            {
-                upTask->Run();
-            }
-        }
-        else
-        {
-            std::shared_ptr<v8::Task> spTask(std::move(upTask));
-            CallWithLockAsync(allowNesting, [allowNesting, spTask] (V8IsolateImpl* pIsolateImpl)
-            {
-                spTask->Run();
+            spTask->Run();
 
-                BEGIN_MUTEX_SCOPE(pIsolateImpl->m_DataMutex)
-                    pIsolateImpl->m_Statistics.BumpInvokedTaskCount(allowNesting ? TaskKind::Foreground : TaskKind::NonNestableForeground);
-                END_MUTEX_SCOPE
-            });
-
-            BEGIN_MUTEX_SCOPE(m_DataMutex)
-                m_Statistics.BumpPostedTaskCount(allowNesting ? TaskKind::Foreground : TaskKind::NonNestableForeground);
+            BEGIN_MUTEX_SCOPE(pIsolateImpl->m_DataMutex)
+                pIsolateImpl->m_Statistics.BumpInvokedTaskCount(allowNesting ? TaskKind::Foreground : TaskKind::NonNestableForeground);
             END_MUTEX_SCOPE
-        }
+        });
+
+        BEGIN_MUTEX_SCOPE(m_DataMutex)
+            m_Statistics.BumpPostedTaskCount(allowNesting ? TaskKind::Foreground : TaskKind::NonNestableForeground);
+        END_MUTEX_SCOPE
     }
 }
 
